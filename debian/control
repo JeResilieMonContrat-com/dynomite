@@ -1,0 +1,26 @@
+Source: dynomite
+Section: text
+Priority: optional
+Maintainer: Yoann Laissus <yoann.laissus@gmail.com>
+Build-Depends: debhelper (>= 9),
+               dh-autoreconf,
+               libyaml-dev
+Standards-Version: 3.9.6
+Homepage: https://github.com/Netflix/dynomite
+Vcs-Git: https://github.com/Netflix/dynomite.git
+Vcs-Browser: https://github.com/Netflix/dynomite
+
+Package: dynomite
+Architecture: any
+Multi-Arch: foreign
+Recommends: redis-server, memcached
+Depends: ${misc:Depends},
+         ${shlibs:Depends}
+Description: interpreter for the PostScript language and for PDF
+ GPL Ghostscript is used for PostScript/PDF preview and printing.
+ Usually as a back-end to a program such as ghostview, it can display
+ PostScript and PDF documents in an X11 environment.
+ .
+ Furthermore, it can render PostScript and PDF files as graphics to be
+ printed on non-PostScript printers. Supported printers include common
+ dot-matrix, inkjet and laser models.
