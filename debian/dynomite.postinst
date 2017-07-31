@@ -1,0 +1,50 @@
+#!/bin/bash
+
+set -eu
+
+USER="dynomite"
+GROUP="$USER"
+CONFFILE="/etc/dynomite/dynomite.yml"
+
+case "${1}" in
+    configure)
+        adduser \
+            --system \
+            --home /var/lib/dynomite \
+            --quiet \
+            --group \
+            ${USER} || true
+
+        for DIR in /var/lib/dynomite /var/log/dynomite
+        do
+            mkdir -p ${DIR}
+
+            if ! dpkg-statoverride --list ${DIR} >/dev/null 2>&1
+            then
+                chown -R "${USER}:${GROUP}" ${DIR}
+                chmod 750 ${DIR}
+            fi
+        done
+
+        if ! dpkg-statoverride --list ${CONFFILE} >/dev/null 2>&1
+        then
+            dpkg-statoverride --update --add ${USER} ${GROUP} 640 ${CONFFILE}
+        fi
+        
+        echo "Generating a RSA key into /etc/dynomite/key.pem ..."
+        openssl genrsa -out /etc/dynomite/key.pem 2048 2> /dev/null
+        echo "Done, if you have other dynomite instances, please replace with the correct key."
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "postinst called with unknown argument \`${1}'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
