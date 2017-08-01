@@ -1,3 +1,9 @@
+dynomite (0.5.9.2-1~jrmc4) unstable; urgency=medium
+
+  * Add a service, an user, a logrotate and a default config file
+
+ -- Yoann Laissus <yoann.laissus@gmail.com>  Tue, 01 Aug 2017 10:15:52 +0200
+
 dynomite (0.5.9.2-1~jrmc3) unstable; urgency=medium
 
   * Use the right description for dynomite, not ghostscript one !
