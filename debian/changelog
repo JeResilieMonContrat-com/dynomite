@@ -1,3 +1,9 @@
+dynomite (0.6.1-1~jrmc1) unstable; urgency=medium
+  
+  * Bump version to 0.6.1
+
+ -- Yoann Laissus <yoann.laissus@gmail.com>  Thu, 14 Dec 2017 16:50:25 +0200
+
 dynomite (0.5.9.3-1~jrmc1) unstable; urgency=medium
 
   * Bump version to 0.5.9.3
