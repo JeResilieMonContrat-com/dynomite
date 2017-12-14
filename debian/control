@@ -1,0 +1,29 @@
+Source: dynomite
+Section: text
+Priority: optional
+Maintainer: Yoann Laissus <yoann.laissus@gmail.com>
+Build-Depends: debhelper (>= 9),
+               dh-autoreconf,
+               libssl-dev,
+               libyaml-dev
+Standards-Version: 3.9.6
+Homepage: https://github.com/Netflix/dynomite
+Vcs-Git: https://github.com/Netflix/dynomite.git
+Vcs-Browser: https://github.com/Netflix/dynomite
+
+Package: dynomite
+Architecture: any
+Multi-Arch: foreign
+Recommends: redis-server, memcached
+Depends: ${misc:Depends},
+         ${shlibs:Depends}
+Description: a generic dynamo implementation for different key/value storage engines
+ Dynomite is a thin, distributed Dynamo layer for different storage engines and
+ protocols. Dynomite provides sharding and multi-data center replication. It has
+ a shared nothing architecture with no single point of failure (SPOF) that 
+ delivers high availability (HA) even when a server, rack or entire data center
+ goes off‐line.
+ .
+ Redis is currently the primary backend and protocol supported by Dynomite, 
+ while support for Memcached is partially implemented. Future versions of 
+ Dynomite will support additional backends.

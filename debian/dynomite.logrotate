@@ -1,0 +1,11 @@
+/var/log/dynomite/dynomite*.log {
+  weekly
+  missingok
+  rotate 12
+  postrotate
+    [ ! -f /var/run/dynomite/dynomite.pid ] || kill -HUP `cat /var/run/dynomite/dynomite.pid`
+  endscript
+  compress
+  notifempty
+  delaycompress
+} 

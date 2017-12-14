@@ -1,0 +1,15 @@
+#!/bin/bash
+
+set -e
+
+CONFFILE="/etc/dynomite/dynomite.yml"
+
+if [ "${1}" = "purge" ]
+then
+    dpkg-statoverride --remove ${CONFFILE} || test $? -eq 2
+
+    userdel dynomite || true
+    rm -rf /var/lib/dynomite /var/log/dynomite
+fi
+
+#DEBHELPER# 
