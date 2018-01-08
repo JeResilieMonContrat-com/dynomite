@@ -1,4 +1,4 @@
-dynomite (0.6.1-1~jrmc1) unstable; urgency=medium
+dynomite (0.6.1-1+debian80~jrmc1) unstable; urgency=medium
   
   * Bump version to 0.6.1
 
