@@ -1,9 +1,9 @@
-dynomite (0.6.12-1+debian90~jrmc1) unstable; urgency=medium
+dynomite (0.6.12-1+debian100~jrmc1) unstable; urgency=medium
 
   * Remove the OpenSSL patch, applied upstream
   * Bump version to 0.6.12
 
- -- Yoann Laissus <yoann.laissus@gmail.com>  Wed, 02 Jan 2019 18:05:12 +0100
+ -- Yoann Laissus <yoann.laissus@gmail.com>  Sun, 18 Aug 2019 18:38:40 +0200
 
 dynomite (0.6.1-1+debian90~jrmc2) unstable; urgency=medium
 
