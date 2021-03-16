@@ -124,6 +124,10 @@ static rstatus_t aes_init(void) {
   aes_encrypt_ctx = (EVP_CIPHER_CTX *)malloc(sizeof(EVP_CIPHER_CTX));
   aes_decrypt_ctx = (EVP_CIPHER_CTX *)malloc(sizeof(EVP_CIPHER_CTX));
 
+  if (aes_encrypt_ctx == NULL || aes_decrypt_ctx == NULL) {
+    return DN_ENOMEM;
+  }
+
   EVP_CIPHER_CTX_init(aes_encrypt_ctx);
   EVP_CIPHER_CTX_init(aes_decrypt_ctx);
 #else
@@ -171,17 +175,23 @@ rstatus_t crypto_init(struct server_pool *sp) {
 }
 
 rstatus_t crypto_deinit(void) {
+  if (aes_encrypt_ctx != NULL) {
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
-  EVP_CIPHER_CTX_cleanup(aes_encrypt_ctx);
-  EVP_CIPHER_CTX_cleanup(aes_decrypt_ctx);
-  free(aes_encrypt_ctx);
-  free(aes_decrypt_ctx);
+    EVP_CIPHER_CTX_cleanup(aes_encrypt_ctx);
+    free(aes_encrypt_ctx);
 #else
-
-  EVP_CIPHER_CTX_free(aes_encrypt_ctx);
-  EVP_CIPHER_CTX_free(aes_decrypt_ctx);
+    EVP_CIPHER_CTX_free(aes_encrypt_ctx);
 #endif
+  }
 
+  if (aes_decrypt_ctx != NULL) {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    EVP_CIPHER_CTX_cleanup(aes_decrypt_ctx);
+    free(aes_decrypt_ctx);
+#else
+    EVP_CIPHER_CTX_free(aes_decrypt_ctx);
+#endif
+  }
   return DN_OK;
 }
 
@@ -260,7 +270,7 @@ rstatus_t aes_encrypt(const unsigned char *msg, size_t msg_len,
   int enc_msg_len = 0;
 
   *enc_msg = (unsigned char *)malloc(msg_len + AES_BLOCK_SIZE);
-  if (enc_msg == NULL) return DN_ERROR;
+  if (*enc_msg == NULL) return DN_ERROR;
 
   // if(!EVP_EncryptInit_ex(aes_encrypt_ctx, aes_cipher, NULL, arg_aes_key,
   // aes_iv)) {
@@ -302,8 +312,8 @@ rstatus_t dyn_aes_encrypt(const unsigned char *msg, size_t msg_len,
   // aes_iv)) {
   if (!EVP_EncryptInit_ex(aes_encrypt_ctx, aes_cipher, NULL, arg_aes_key,
                           arg_aes_key)) {
-    loga_hexdump(
-        msg, msg_len,
+    log_hexdump(
+        LOG_DEBUG, msg, msg_len,
         "Bad data in EVP_EncryptInit_ex, crypto data with %ld bytes of data",
         msg_len);
     return DN_ERROR;
@@ -311,8 +321,8 @@ rstatus_t dyn_aes_encrypt(const unsigned char *msg, size_t msg_len,
 
   if (!EVP_EncryptUpdate(aes_encrypt_ctx, mbuf->start, &block_len,
                          (unsigned char *)msg, (int)msg_len)) {
-    loga_hexdump(
-        msg, msg_len,
+    log_hexdump(
+        LOG_DEBUG, msg, msg_len,
         "Bad data in EVP_EncryptUpdate, crypto data with %ld bytes of data",
         msg_len);
     return DN_ERROR;
@@ -321,8 +331,8 @@ rstatus_t dyn_aes_encrypt(const unsigned char *msg, size_t msg_len,
 
   if (!EVP_EncryptFinal_ex(aes_encrypt_ctx, mbuf->start + enc_msg_len,
                            &block_len)) {
-    loga_hexdump(
-        msg, msg_len,
+    log_hexdump(
+        LOG_DEBUG, msg, msg_len,
         "Bad data in EVP_EncryptFinal_ex, crypto data with %ld bytes of data",
         msg_len);
     return DN_ERROR;
@@ -356,8 +366,8 @@ rstatus_t dyn_aes_decrypt(unsigned char *enc_msg, size_t enc_msg_len,
     // aes_iv)) {
     if (!EVP_DecryptInit_ex(aes_decrypt_ctx, aes_cipher, NULL, arg_aes_key,
                             arg_aes_key)) {
-      loga_hexdump(
-          enc_msg, enc_msg_len,
+      log_hexdump(
+          LOG_DEBUG, enc_msg, enc_msg_len,
           "Bad data in EVP_DecryptInit_ex, crypto data with %ld bytes of data",
           enc_msg_len);
       return DN_ERROR;
@@ -365,8 +375,8 @@ rstatus_t dyn_aes_decrypt(unsigned char *enc_msg, size_t enc_msg_len,
 
     if (!EVP_DecryptUpdate(aes_decrypt_ctx, mbuf->pos, (int *)&block_len,
                            enc_msg, (int)enc_msg_len)) {
-      loga_hexdump(
-          enc_msg, enc_msg_len,
+      log_hexdump(
+          LOG_DEBUG, enc_msg, enc_msg_len,
           "Bad data in EVP_DecryptUpdate, crypto data with %ld bytes of data",
           enc_msg_len);
       return DN_ERROR;
@@ -375,8 +385,8 @@ rstatus_t dyn_aes_decrypt(unsigned char *enc_msg, size_t enc_msg_len,
 
     if (!EVP_DecryptFinal_ex(aes_decrypt_ctx, mbuf->pos + dec_len,
                              (int *)&block_len)) {
-      loga_hexdump(
-          enc_msg, enc_msg_len,
+      log_hexdump(
+          LOG_DEBUG, enc_msg, enc_msg_len,
           "Bad data in EVP_DecryptFinal_ex, crypto data with %ld bytes of data",
           enc_msg_len);
       return DN_ERROR;

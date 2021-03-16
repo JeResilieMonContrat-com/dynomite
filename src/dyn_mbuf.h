@@ -65,6 +65,8 @@ static inline bool mbuf_full(struct mbuf *mbuf) {
   return mbuf->last == mbuf->end ? true : false;
 }
 
+size_t mbuf_chunk_sz();
+
 void mbuf_init(size_t mbuf_chunk_size);
 void mbuf_deinit(void);
 struct mbuf *mbuf_get(void);
@@ -74,7 +76,7 @@ uint64_t mbuf_free_queue_size(void);
 void mbuf_dump(struct mbuf *mbuf);
 void mbuf_rewind(struct mbuf *mbuf);
 uint32_t mbuf_length(struct mbuf *mbuf);
-uint32_t mbuf_size(struct mbuf *mbuf);
+uint32_t mbuf_remaining_space(struct mbuf *mbuf);
 size_t mbuf_data_size(void);
 void mbuf_insert(struct mhdr *mhdr, struct mbuf *mbuf);
 void mbuf_insert_head(struct mhdr *mhdr, struct mbuf *mbuf);

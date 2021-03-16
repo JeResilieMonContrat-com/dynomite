@@ -47,9 +47,12 @@
 #include "dyn_dict_msg_id.h"
 #include "dyn_dnode_peer.h"
 #include "dyn_server.h"
+#include "dyn_util.h"
 
-static rstatus_t msg_quorum_rsp_handler(struct msg *req, struct msg *rsp);
-static msg_response_handler_t msg_get_rsp_handler(struct msg *req);
+static rstatus_t msg_quorum_rsp_handler(struct context *ctx, struct msg *req, struct msg *rsp);
+static rstatus_t msg_each_quorum_rsp_handler(struct context *ctx, struct msg *req,
+    struct msg *rsp);
+static msg_response_handler_t msg_get_rsp_handler(struct context *ctx, struct msg *req);
 
 static rstatus_t rewrite_query_if_necessary(struct msg **req,
                                             struct context *ctx);
@@ -230,8 +233,10 @@ static void client_close(struct context *ctx, struct conn *conn) {
  * request scenario and then use the post coalesce logic to cook up a combined
  * response
  */
-static rstatus_t client_handle_response(struct conn *conn, msgid_t reqid,
+static rstatus_t client_handle_response(struct context *ctx, struct conn *conn, msgid_t reqid,
                                         struct msg *rsp) {
+
+
   // now the handler owns the response.
   ASSERT(conn->type == CONN_CLIENT);
   // Fetch the original request
@@ -242,7 +247,7 @@ static rstatus_t client_handle_response(struct conn *conn, msgid_t reqid,
     return DN_OK;
   }
   // we have to submit the response irrespective of the unref status.
-  rstatus_t status = msg_handle_response(req, rsp);
+  rstatus_t status = msg_handle_response(ctx, req, rsp);
   if (conn->waiting_to_unref) {
     // don't care about the status.
     if (req->awaiting_rsps) return DN_OK;
@@ -336,6 +341,11 @@ struct msg *req_recv_next(struct context *ctx, struct conn *conn, bool alloc) {
     conn->rmsg = req;
   }
 
+  // Record timetamps if repairs are enabled.
+  if (is_read_repairs_enabled()) {
+    req->timestamp = current_timestamp_in_millis();
+  }
+
   return req;
 }
 
@@ -357,9 +367,18 @@ static bool req_filter(struct context *ctx, struct conn *conn,
   if (req->quit) {
     ASSERT(conn->rmsg == NULL);
     log_debug(LOG_VERB, "%s filter quit %s", print_obj(conn), print_obj(req));
+
+    // The client expects to receive an "+OK\r\n" response, so make sure
+    // to do that.
+    IGNORE_RET_VAL(simulate_ok_rsp(ctx, conn, req));
+
     conn->eof = 1;
     conn->recv_ready = 0;
-    req_put(req);
+    return true;
+  }
+
+  // If this is a Dynomite configuration message, don't forward it.
+  if (is_msg_type_dyno_config(req->type)) {
     return true;
   }
 
@@ -404,7 +423,7 @@ void req_forward_error(struct context *ctx, struct conn *conn, struct msg *req,
   rsp->dmsg = dmsg_get();
   rsp->dmsg->id = req->id;
 
-  rstatus_t status = conn_handle_response(
+  rstatus_t status = conn_handle_response(ctx,
       conn, req->parent_id ? req->parent_id : req->id, rsp);
   IGNORE_RET_VAL(status);
 }
@@ -512,7 +531,7 @@ static void req_forward_stats(struct context *ctx, struct msg *req) {
   }
 }
 
-rstatus_t local_req_forward(struct context *ctx, struct conn *c_conn,
+rstatus_t req_forward_local_datastore(struct context *ctx, struct conn *c_conn,
                             struct msg *req, uint8_t *key, uint32_t keylen,
                             dyn_error_t *dyn_error_code) {
   rstatus_t status;
@@ -583,7 +602,7 @@ rstatus_t local_req_forward(struct context *ctx, struct conn *c_conn,
   return DN_OK;
 }
 
-static rstatus_t admin_local_req_forward(struct context *ctx,
+static rstatus_t admin_req_forward_local_datastore(struct context *ctx,
                                          struct conn *c_conn, struct msg *req,
                                          struct rack *rack, uint8_t *key,
                                          uint32_t keylen,
@@ -600,98 +619,143 @@ static rstatus_t admin_local_req_forward(struct context *ctx,
 
   log_debug(LOG_NOTICE, "%s Need to delete [%.*s] ", print_obj(c_conn), keylen,
             key);
-  return local_req_forward(ctx, c_conn, req, key, keylen, dyn_error_code);
+  return req_forward_local_datastore(ctx, c_conn, req, key, keylen, dyn_error_code);
 }
 
-/* On Success, the request is placed in the other connection's inq. Otherwise
- * it is the caller's responsibility to take care of freeing it.
- */
-rstatus_t remote_req_forward(struct context *ctx, struct conn *c_conn,
-                             struct msg *req, struct rack *rack, uint8_t *key,
-                             uint32_t keylen, dyn_error_t *dyn_error_code) {
-  ASSERT((c_conn->type == CONN_CLIENT) ||
-         (c_conn->type == CONN_DNODE_PEER_CLIENT));
+rstatus_t req_forward_to_peer(struct context *ctx, struct conn *c_conn,
+    struct msg *req, struct node *peer, uint8_t* key, uint32_t keylen,
+    struct mbuf *orig_mbuf, bool force_copy, bool force_swallow,
+    dyn_error_t *dyn_error_code) {
 
-  struct node *peer = dnode_peer_pool_server(ctx, c_conn->owner, rack, key,
-                                             keylen, req->msg_routing);
+  rstatus_t status;
+
+  bool same_dc = false;
+  bool same_rack = false;
+  struct msg *rack_msg = NULL;
+
   if (peer->is_local) {
-    return local_req_forward(ctx, c_conn, req, key, keylen, dyn_error_code);
+    // Since the peer is the same as this node, it's the same DC and rack.
+    same_dc = same_rack = true;
+    // If the peer is pointing to the current node itself, forward it directly to the
+    // datastore.
+    status = req_forward_local_datastore(ctx, c_conn, req, key, keylen, dyn_error_code);
+    if (status != DN_OK) {
+      log_error("Failed to forward request to local datastore.");
+      goto error;
+    }
+    return status;
   }
 
-  // now get a peer connection
+  struct server_pool *pool = c_conn->owner;
+  ASSERT(pool != NULL);
+
+  // Figure out if the peer is in the same DC or rack.
+  same_dc = peer->is_same_dc;
+  same_rack = !(string_compare(&peer->rack, &pool->rack)) && same_dc;
+  if (force_copy || !same_rack) {
+    // Make a copy of the message if forced or if the peer is not on the same rack or DC.
+    rack_msg = msg_get(c_conn, req->is_request, __FUNCTION__);
+    if (rack_msg == NULL) {
+      log_error("Failed to allocate memory for inter-node message.");
+      *dyn_error_code = DYNOMITE_UNKNOWN_ERROR;
+      status = DN_ENOMEM;
+      goto error;
+    }
+    msg_clone(req, orig_mbuf, rack_msg);
+  } else {
+    rack_msg = req;
+  }
+
+  if (!(same_dc && same_rack) || force_swallow) {
+    // Swallow responses from remote racks or DCs.
+    rack_msg->swallow = true;
+  }
+
+  // Get a connection to the node.
   struct conn *p_conn = dnode_peer_get_conn(ctx, peer, c_conn->sd);
-  if (!p_conn) {
-    // No active connection. return error
+  if (p_conn == NULL) {
+    status = DN_ERROR;
     *dyn_error_code = PEER_HOST_NOT_CONNECTED;
-    return DN_ERROR;
+    goto error;
   }
 
-  return dnode_peer_req_forward(ctx, c_conn, p_conn, req, rack, key, keylen,
-                                dyn_error_code);
+  // Finally, forward the message to a peer DNODE.
+  status = dnode_peer_req_forward(
+      ctx, c_conn, p_conn, rack_msg, key, keylen, dyn_error_code);
+  if (status != DN_OK) {
+    log_error("Failure in forwarding a request to a dnode");
+    goto error;
+  }
+
+  return status;
+
+ error:
+  // Forward errors only if we failed to talk to the same DC. We currently ignore cross-DC
+  // errors.
+  if (same_dc) {
+    // We forward the error if the target was in the same rack, or if it was in a remote
+    // rack and we're expecting a quorum response.
+    if ((!same_rack && req->consistency != DC_ONE) || same_rack) {
+      req_forward_error(ctx, c_conn,
+          (rack_msg ? rack_msg : req),
+          status, *dyn_error_code);
+    } else if (!same_rack && req->consistency == DC_ONE) {
+      // We won't receive a response from one host, so account for that
+      // (even though it's effectively a no-op as we wait only for one response in
+      // DC_ONE).
+      req->rspmgr.max_responses--;
+      log_error("Swallowing cross rack error due to DC_ONE. Error: %d '%s'",
+          status, dyn_error_source(*dyn_error_code));
+    }
+  }
+  // Release the copy if we made one above..
+  if (rack_msg != NULL && (force_copy || !same_rack)) {
+    req_put(rack_msg);
+  }
+  return status;
 }
 
-void req_forward_all_local_racks(struct context *ctx, struct conn *c_conn,
+void req_forward_all_racks_for_dc(struct context *ctx, struct conn *c_conn,
                                  struct msg *req, struct mbuf *orig_mbuf,
                                  uint8_t *key, uint32_t keylen,
                                  struct datacenter *dc) {
   uint8_t rack_cnt = (uint8_t)array_n(&dc->racks);
   uint8_t rack_index;
-  init_response_mgr(&req->rspmgr, req, req->is_read, rack_cnt, c_conn);
+
+  if (req->rspmgrs_inited == false) {
+    if (req->consistency == DC_EACH_SAFE_QUORUM) {
+      init_response_mgr_all_dcs(ctx, req, c_conn, dc);
+    } else {
+      init_response_mgr(req, &req->rspmgr, rack_cnt, c_conn);
+    }
+  }
   log_info("%s %s same DC racks:%d expect replies %d", print_obj(c_conn),
            print_obj(req), rack_cnt, req->rspmgr.max_responses);
-  for (rack_index = 0; rack_index < rack_cnt; rack_index++) {
+
+  for (rack_index = 0; rack_index < rack_cnt; ++rack_index) {
     struct rack *rack = array_get(&dc->racks, rack_index);
-    struct server_pool *pool = c_conn->owner;
-    dyn_error_t dyn_error_code = 0;
-    rstatus_t s = DN_OK;
+    // Pick the token owner peer from the selected rack.
+    struct node *peer = dnode_peer_pool_server(ctx, c_conn->owner, rack, key,
+                                               keylen, req->msg_routing);
+    dyn_error_t dyn_error_code = DYNOMITE_OK;
 
-    if (string_compare(rack->name, &pool->rack) == 0) {
-      // Local Rack
-      s = remote_req_forward(ctx, c_conn, req, rack, key, keylen,
-                             &dyn_error_code);
-      if (s != DN_OK) {
-        req_forward_error(ctx, c_conn, req, s, dyn_error_code);
-      }
+    // Forward the message to the peer.
+    rstatus_t status = req_forward_to_peer(ctx, c_conn, req, peer, key, keylen,
+        orig_mbuf, false /* force_copy? */, false /* force swallow? */,
+        &dyn_error_code);
 
-    } else {
-      // Remote Rack
-      struct msg *rack_msg = msg_get(c_conn, req->is_request, __FUNCTION__);
-      if (rack_msg == NULL) {
-        log_error(
-            "whelp, looks like yer screwed "
-            "now, buddy. no inter-rack messages for you!");
-        if (req->consistency != DC_ONE) {
-          // expecting a reply to form a quorum
-          req_forward_error(ctx, c_conn, req, DN_ENOMEM,
-                            DYNOMITE_UNKNOWN_ERROR);
-        }
-        continue;
-      }
-
-      msg_clone(req, orig_mbuf, rack_msg);
-      rack_msg->swallow = true;
-
-      log_info("%s forwarding cloned %s to same dc rack '%.*s'",
-               print_obj(c_conn), print_obj(rack_msg), rack->name->len,
-               rack->name->data);
-
-      s = remote_req_forward(ctx, c_conn, rack_msg, rack, key, keylen,
-                             &dyn_error_code);
-      if (s != DN_OK) {
-        if (req->consistency != DC_ONE) {
-          // expecting a reply to form a quorum
-          req_forward_error(ctx, c_conn, rack_msg, s, dyn_error_code);
-        }
-        req_put(rack_msg);
-        continue;
-      }
-    }
+    // We ignore the return value since the callee will take care of forwarding errors.
+    IGNORE_RET_VAL(status);
   }
 }
 
 static bool request_send_to_all_dcs(struct msg *req) {
   // There is a routing override
   if (req->msg_routing != ROUTING_NORMAL) return false;
+
+  // Under DC_EACH_SAFE_QUORUM, we need to send reads and writes to all
+  // DCs.
+  if (req->consistency == DC_EACH_SAFE_QUORUM) return true;
 
   // Reads are not propagated
   if (req->is_read) return false;
@@ -714,9 +778,41 @@ static bool request_send_to_all_local_racks(struct msg *req) {
   // A write should go to all racks
   if (!req->is_read) return true;
 
-  if ((req->consistency == DC_QUORUM) || (req->consistency == DC_SAFE_QUORUM))
+  if ((req->consistency == DC_QUORUM)
+    || (req->consistency == DC_SAFE_QUORUM)
+    || (req->consistency == DC_EACH_SAFE_QUORUM)) {
     return true;
+  }
   return false;
+}
+
+/**
+ * Forward 'req' to all DCs, racks and nodes.
+ *
+ */
+static rstatus_t req_forward_all_dcs_all_racks_all_nodes(struct context *ctx,
+    struct conn *c_conn, struct msg *req, struct mbuf *orig_mbuf, uint8_t *key,
+    uint32_t keylen, dyn_error_t *dyn_error_code) {
+  rstatus_t status = DN_OK;
+  struct server_pool *pool = c_conn->owner;
+  uint32_t peer_cnt = array_n(&pool->peers);
+
+  req->rsp_handler = msg_get_rsp_handler(ctx, req);
+
+  // Ennumerate every node (or 'peer') in the cluster and send 'req' to each of them.
+  uint32_t peer_idx = 0;
+  for (peer_idx = 0; peer_idx < peer_cnt; ++peer_idx) {
+    struct node *peer = *(struct node **)array_get(&pool->peers, peer_idx);
+
+    // Force a swallow for all the peers since we don't care about matching the return
+    // values for each one.
+    status = req_forward_to_peer(ctx, c_conn, req, peer, key, keylen,
+        orig_mbuf, true /* force_copy */, true /* force swallow */, dyn_error_code);
+    // We ignore the return value since the callee will take care of forwarding errors.
+    IGNORE_RET_VAL(status);
+  }
+
+  return status;
 }
 
 static void req_forward_remote_dc(struct context *ctx, struct conn *c_conn,
@@ -726,60 +822,57 @@ static void req_forward_remote_dc(struct context *ctx, struct conn *c_conn,
   const uint32_t rack_cnt = array_n(&dc->racks);
   if (rack_cnt == 0) return;
 
+  if (req->consistency == DC_EACH_SAFE_QUORUM) {
+    // Under 'DC_EACH_SAFE_QUORUM', we want to hear back from at least
+    // quorum racks in each DC, so send it to all racks in remote DCs.
+    req_forward_all_racks_for_dc(ctx, c_conn, req, orig_mbuf, key, keylen, dc);
+    return;
+  }
+
+  // If we're not expecting a consistency level of 'DC_EACH_SAFE_QUORUM', then
+  // we send it to only to the preselected rack in the remote DCs. If that's not
+  // reachable, we failover to another in the remote DC.
+
+  // Pick the preferred pre-selected rack for this DC.
   struct rack *rack = dc->preselected_rack_for_replication;
   if (rack == NULL) rack = array_get(&dc->racks, 0);
 
-  struct msg *rack_msg = msg_get(c_conn, req->is_request, __FUNCTION__);
-  if (rack_msg == NULL) {
-    log_debug(LOG_VERB,
-              "whelp, looks like yer screwed now, buddy. no inter-rack "
-              "messages for you!");
-    return;
-  }
+  log_info("%s %s Forwarding to remote DC; rack name:%.*s", print_obj(c_conn),
+           print_obj(req), rack->name->len, rack->name->data);
 
-  msg_clone(req, orig_mbuf, rack_msg);
-  rack_msg->swallow = true;
+  // Pick the token owner peer from the selected rack.
+  struct node *peer = dnode_peer_pool_server(ctx, c_conn->owner, rack, key,
+                                             keylen, req->msg_routing);
 
-  log_info("%s forwarding cloned %s on remote dc rack '%.*s'",
-           print_obj(c_conn), print_obj(rack_msg), rack->name->len,
-           rack->name->data);
+  dyn_error_t dyn_error_code = DYNOMITE_OK;
+  // Forward the message to the peer.
+  rstatus_t status = req_forward_to_peer(ctx, c_conn, req, peer, key, keylen,
+      orig_mbuf, true /* force_copy */, false /* force swallow? */,
+      &dyn_error_code);
 
-  dyn_error_t dyn_error_code = 0;
-  rstatus_t s = remote_req_forward(ctx, c_conn, rack_msg, rack, key, keylen,
-                                   &dyn_error_code);
-  if (s == DN_OK) {
-    return;
-  }
-  req_put(rack_msg);
+  // If we succeeded in sending it to the preselected rack in the preferred remote DC,
+  // then we return, else we go ahead to try other racks in the remote DC.
+  if (status == DN_OK) return;
+
   // Start over with another rack.
   uint8_t rack_index;
   for (rack_index = 0; rack_index < rack_cnt; rack_index++) {
     rack = array_get(&dc->racks, rack_index);
+    peer = dnode_peer_pool_server(ctx, c_conn->owner, rack, key,
+                                  keylen, req->msg_routing);
 
     if (rack == dc->preselected_rack_for_replication) continue;
-    rack_msg = msg_get(c_conn, req->is_request, __FUNCTION__);
-    if (rack_msg == NULL) {
-      log_debug(LOG_VERB,
-                "whelp, looks like yer screwed now, buddy. no inter-rack "
-                "messages for you!");
-      return;
-    }
-
-    msg_clone(req, orig_mbuf, rack_msg);
-    rack_msg->swallow = true;
-
-    log_info("%s FAILOVER forwarding cloned %s to remote dc rack '%.*s'",
-             print_obj(c_conn), print_obj(rack_msg), rack->name->len,
+    log_info("%s FAILOVER forwarding msg %s to remote dc rack '%.*s'",
+             print_obj(c_conn), print_obj(req), rack->name->len,
              rack->name->data);
 
-    dyn_error_code = DYNOMITE_OK;
-    s = remote_req_forward(ctx, c_conn, rack_msg, rack, key, keylen,
-                           &dyn_error_code);
-    if (s == DN_OK) {
+    status = req_forward_to_peer(ctx, c_conn, req, peer, key, keylen,
+        orig_mbuf, true /* force_copy */, false /* force swallow */,
+        &dyn_error_code);
+    if (status == DN_OK) {
       stats_pool_incr(ctx, remote_peer_failover_requests);
       return;
     }
-    req_put(rack_msg);
   }
   stats_pool_incr(ctx, remote_peer_dropped_requests);
 }
@@ -789,20 +882,24 @@ static void req_forward_local_dc(struct context *ctx, struct conn *c_conn,
                                  uint8_t *key, uint32_t keylen,
                                  struct datacenter *dc) {
   struct server_pool *pool = c_conn->owner;
-  req->rsp_handler = msg_get_rsp_handler(req);
+  req->rsp_handler = msg_get_rsp_handler(ctx, req);
   if (request_send_to_all_local_racks(req)) {
     // send request to all local racks
-    req_forward_all_local_racks(ctx, c_conn, req, orig_mbuf, key, keylen, dc);
+    req_forward_all_racks_for_dc(ctx, c_conn, req, orig_mbuf, key, keylen, dc);
   } else {
     // send request to only local token owner
     struct rack *rack =
         server_get_rack_by_dc_rack(pool, &pool->rack, &pool->dc);
+    // Pick the token owner peer from the selected rack.
+    struct node *peer = dnode_peer_pool_server(ctx, c_conn->owner, rack, key,
+                                               keylen, req->msg_routing);
+
     dyn_error_t dyn_error_code = 0;
-    rstatus_t s = remote_req_forward(ctx, c_conn, req, rack, key, keylen,
-                                     &dyn_error_code);
-    if (s != DN_OK) {
-      req_forward_error(ctx, c_conn, req, s, dyn_error_code);
-    }
+    // Forward the message to the peer.
+    rstatus_t status = req_forward_to_peer(ctx, c_conn, req, peer, key, keylen,
+        orig_mbuf, false /* force_copy? */, false /* force swallow? */,
+        &dyn_error_code);
+    IGNORE_RET_VAL(status);
   }
 }
 
@@ -815,10 +912,10 @@ static void req_forward(struct context *ctx, struct conn *c_conn,
   ASSERT(c_conn->type == CONN_CLIENT);
 
   if (req->is_read) {
-    if (req->type != MSG_REQ_REDIS_PING)
-      stats_pool_incr(ctx, client_read_requests);
-  } else
+    if (req->type != MSG_REQ_REDIS_PING) stats_pool_incr(ctx, client_read_requests);
+  } else {
     stats_pool_incr(ctx, client_write_requests);
+  }
 
   uint32_t keylen = 0;
   uint8_t *key = msg_get_tagged_key(req, 0, &keylen);
@@ -831,31 +928,30 @@ static void req_forward(struct context *ctx, struct conn *c_conn,
   // add the message to the dict
   dictAdd(c_conn->outstanding_msgs_dict, &req->id, req);
 
-  s = g_verify_request(
-      req, pool, server_get_rack_by_dc_rack(pool, &pool->rack, &pool->dc));
-  if (s != DN_OK) {
-    if (req->expect_datastore_reply) {
-      conn_enqueue_outq(ctx, c_conn, req);
-    }
-    req_forward_error(ctx, c_conn, req, DN_OK, s);
-    return;
-  }
-
   // need to capture the initial mbuf location as once we add in the dynomite
   // headers (as mbufs to the src req), that will bork the request sent to
   // secondary racks
   struct mbuf *orig_mbuf = STAILQ_FIRST(&req->mhdr);
 
-  /* enqueue message (request) into client outq, if response is expected */
+  // Enqueue message 'req' into the client outq, if a response is expected.
   if (req->expect_datastore_reply) {
     conn_enqueue_outq(ctx, c_conn, req);
+  }
+
+  // Make sure that this is a valid request according to Dynomite.
+  s = g_verify_request(
+      req, pool, server_get_rack_by_dc_rack(pool, &pool->rack, &pool->dc));
+  if (s != DN_OK) {
+    // If this was an invalid request, we forward an error.
+    req_forward_error(ctx, c_conn, req, DN_OK, s);
+    return;
   }
 
   if (ctx->admin_opt == 1) {
     if (req->type == MSG_REQ_REDIS_DEL || req->type == MSG_REQ_MC_DELETE) {
       struct rack *rack =
           server_get_rack_by_dc_rack(pool, &pool->rack, &pool->dc);
-      s = admin_local_req_forward(ctx, c_conn, req, rack, key, keylen,
+      s = admin_req_forward_local_datastore(ctx, c_conn, req, rack, key, keylen,
                                   &dyn_error_code);
       if (s != DN_OK) {
         req_forward_error(ctx, c_conn, req, s, dyn_error_code);
@@ -864,35 +960,50 @@ static void req_forward(struct context *ctx, struct conn *c_conn,
     }
   }
 
+  req->consistency = req->is_read ? conn_get_read_consistency(c_conn)
+                                  : conn_get_write_consistency(c_conn);
+
   if (req->msg_routing == ROUTING_LOCAL_NODE_ONLY) {
     // Strictly local host only
     req->consistency = DC_ONE;
     req->rsp_handler = msg_local_one_rsp_handler;
 
-    s = local_req_forward(ctx, c_conn, req, key, keylen, &dyn_error_code);
+    s = req_forward_local_datastore(ctx, c_conn, req, key, keylen, &dyn_error_code);
     if (s != DN_OK) {
       req_forward_error(ctx, c_conn, req, s, dyn_error_code);
     }
     return;
   }
 
-  req->consistency = req->is_read ? conn_get_read_consistency(c_conn)
-                                  : conn_get_write_consistency(c_conn);
+  if (req->msg_routing == ROUTING_ALL_NODES_ALL_RACKS_ALL_DCS) {
+    // Under this routing mechanism, it doesn't make sense to check for quorum, so we set the
+    // consistency to DC_ONE regardless of the configuration.
+    req->consistency = DC_ONE;
 
-  /* forward the request */
+    // Send 'req' to every node in the cluster.
+    s = req_forward_all_dcs_all_racks_all_nodes(ctx, c_conn, req, orig_mbuf, key, keylen,
+        &dyn_error_code);
+    if (s != DN_OK) {
+      log_error("Failure in forwarding a ROUTING_ALL_NODES_ALL_RACKS_ALL_DCS "\
+                "request to one or more nodes");
+      // Errors would have already been forwarded by callee so we do nothing else here.
+    }
+    return;
+  }
+
+  /* forward the request based on other 'msg_routing' policies. */
   uint32_t dc_cnt = array_n(&pool->datacenters);
   uint32_t dc_index;
-
   for (dc_index = 0; dc_index < dc_cnt; dc_index++) {
     struct datacenter *dc = array_get(&pool->datacenters, dc_index);
     if (dc == NULL) {
-      log_error("Wow, this is very bad, dc is NULL");
+      log_error("FATAL ERROR: Server pool lost track of existing DCs.");
       return;
     }
 
-    if (string_compare(dc->name, &pool->dc) == 0)
+    if (string_compare(dc->name, &pool->dc) == 0) {
       req_forward_local_dc(ctx, c_conn, req, orig_mbuf, key, keylen, dc);
-    else if (request_send_to_all_dcs(req)) {
+    } else if (request_send_to_all_dcs(req)) {
       req_forward_remote_dc(ctx, c_conn, req, orig_mbuf, key, keylen, dc);
     }
   }
@@ -908,6 +1019,8 @@ static void req_forward(struct context *ctx, struct conn *c_conn,
 rstatus_t rewrite_query_if_necessary(struct msg **req, struct context *ctx) {
   bool did_rewrite = false;
   struct msg *new_req = NULL;
+
+  msg_type_t orig_msg_type = (*req)->type;
   rstatus_t ret_status = g_rewrite_query(*req, ctx, &did_rewrite, &new_req);
   THROW_STATUS(ret_status);
 
@@ -916,6 +1029,36 @@ rstatus_t rewrite_query_if_necessary(struct msg **req, struct context *ctx) {
     // the original request and point it to the 'new_req'.
     msg_put(*req);
     *req = new_req;
+    (*req)->orig_type = orig_msg_type;
+  }
+  return DN_OK;
+}
+
+/*
+ * Rewrites a query as a script that updates both the data and metadata.
+ *
+ * If a rewrite occured, it will replace '*req' with the new 'msg' that contains
+ * the new query and free up the original msg.
+ *
+ */
+static rstatus_t rewrite_query_with_timestamp_md(struct msg **req, struct context *ctx) {
+
+  if (is_read_repairs_enabled() == false) return DN_OK;
+
+  bool did_rewrite = false;
+  struct msg *new_req = NULL;
+
+  msg_type_t orig_msg_type = (*req)->type;
+  rstatus_t ret_status = g_rewrite_query_with_timestamp_md(
+      *req, ctx, &did_rewrite, &new_req);
+  THROW_STATUS(ret_status);
+
+  if (did_rewrite) {
+    // If we successfully did a rewrite, we neet to make sure that the 'new_req' is the
+    // msg considered from here on, and record the original msg for later reference.
+    new_req->orig_msg = *req;
+    *req = new_req;
+    (*req)->orig_type = orig_msg_type;
   }
   return DN_OK;
 }
@@ -958,6 +1101,9 @@ void req_recv_done(struct context *ctx, struct conn *conn, struct msg *req,
   status = fragment_query_if_necessary(req, conn, &frag_msgq);
   if (status != DN_OK) goto error;
 
+  status = rewrite_query_with_timestamp_md(&req, ctx);
+  if (status != DN_OK) goto error;
+
   /* if no fragment happened */
   if (TAILQ_EMPTY(&frag_msgq)) {
     req_forward(ctx, conn, req);
@@ -986,21 +1132,26 @@ error:
   return;
 }
 
-static msg_response_handler_t msg_get_rsp_handler(struct msg *req) {
+static msg_response_handler_t msg_get_rsp_handler(struct context *ctx, struct msg *req) {
   if (request_send_to_all_local_racks(req)) {
     // Request is being braoadcasted
     // Check if its quorum
-    if ((req->consistency == DC_QUORUM) || (req->consistency == DC_SAFE_QUORUM))
+    if ((req->consistency == DC_QUORUM) || (req->consistency == DC_SAFE_QUORUM)) {
       return msg_quorum_rsp_handler;
+    } else if (req->consistency == DC_EACH_SAFE_QUORUM) {
+      return msg_each_quorum_rsp_handler;
+    }
   }
+
   return msg_local_one_rsp_handler;
 }
 
-rstatus_t msg_local_one_rsp_handler(struct msg *req, struct msg *rsp) {
+rstatus_t msg_local_one_rsp_handler(struct context *ctx, struct msg *req, struct msg *rsp) {
   ASSERT_LOG(!req->selected_rsp,
              "Received more than one response for dc_one.\
                %s prev %s new rsp %s",
              print_obj(req), print_obj(req->selected_rsp), print_obj(rsp));
+
   req->awaiting_rsps = 0;
   rsp->peer = req;
   req->is_error = rsp->is_error;
@@ -1022,12 +1173,25 @@ static rstatus_t swallow_extra_rsp(struct msg *req, struct msg *rsp) {
   return DN_NOOPS;
 }
 
-static rstatus_t msg_quorum_rsp_handler(struct msg *req, struct msg *rsp) {
-  if (req->rspmgr.done) return swallow_extra_rsp(req, rsp);
+static rstatus_t msg_quorum_rsp_handler(struct context *ctx, struct msg *req,
+    struct msg *rsp) {
+  if (req->rspmgr.done) {
+    rstatus_t swallow_status = swallow_extra_rsp(req, rsp);
+    if (is_read_repairs_enabled()) {
+      struct msg *cleanup_msg = NULL;
+      // Check if we can delete tombstone metadata.
+      rstatus_t status = g_clear_repair_md_for_key(ctx, req, &cleanup_msg);
+      if (status == DN_OK) {
+        req_forward(ctx, req->owner, cleanup_msg);
+      }
+      return DN_NOOPS;
+    }
+    return swallow_status;
+  }
   rspmgr_submit_response(&req->rspmgr, rsp);
   if (!rspmgr_check_is_done(&req->rspmgr)) return DN_EAGAIN;
   // rsp is absorbed by rspmgr. so we can use that variable
-  rsp = rspmgr_get_response(&req->rspmgr);
+  rsp = rspmgr_get_response(ctx, &req->rspmgr);
   ASSERT(rsp);
   rspmgr_free_other_responses(&req->rspmgr, rsp);
   rsp->peer = req;
@@ -1035,6 +1199,108 @@ static rstatus_t msg_quorum_rsp_handler(struct msg *req, struct msg *rsp) {
   req->error_code = rsp->error_code;
   req->is_error = rsp->is_error;
   req->dyn_error_code = rsp->dyn_error_code;
+  return DN_OK;
+}
+
+static int find_rspmgr_idx(struct context *ctx, struct response_mgr **rspmgrs,
+    struct string *target_dc_name) {
+  int num_dcs = (int) array_n(&ctx->pool.datacenters);
+
+  int i = 0;
+  for (i = 0; i < num_dcs; ++i) {
+    struct response_mgr *rspmgr = rspmgrs[i];
+    if (string_compare(&rspmgr->dc_name, target_dc_name) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+static bool all_rspmgrs_done(struct context *ctx, struct response_mgr **rspmgrs) {
+  int num_dcs = (int) array_n(&ctx->pool.datacenters);
+  int i = 0;
+  for (i = 0; i < num_dcs; ++i) {
+    struct response_mgr *rspmgr = rspmgrs[i];
+    if (!rspmgr->done) return false;
+  }
+
+  return true;
+}
+
+static struct msg *all_rspmgrs_get_response(struct context *ctx, struct msg *req) {
+  int num_dcs = (int) array_n(&ctx->pool.datacenters);
+  struct msg *rsp = NULL;
+  int i;
+  for (i = 0; i < num_dcs; ++i) {
+    struct response_mgr *rspmgr = req->additional_each_rspmgrs[i];
+    struct msg *dc_rsp = NULL;
+    if (!rsp) {
+      rsp = rspmgr_get_response(ctx, rspmgr);
+      ASSERT(rsp);
+    } else if (rsp->is_error) {
+      // If any of the DCs errored out, we just clean up responses from the
+      // remaining DCs.
+      rspmgr_free_other_responses(rspmgr, NULL);
+      continue;
+    } else {
+      ASSERT(rsp->is_error == false);
+
+      // If the DCs we've processed so far have not seen errors, we need to
+      // make sure that the remaining DCs don't have errors too.
+      dc_rsp = rspmgr_get_response(ctx, rspmgr);
+      ASSERT(dc_rsp);
+      if (dc_rsp->is_error) {
+        rsp_put(rsp);
+        rsp = dc_rsp;
+      } else {
+        // If it's not an error, clear all responses from this DC.
+        rspmgr_free_other_responses(rspmgr, NULL);
+        continue;
+      }
+    }
+
+    rspmgr_free_other_responses(rspmgr, rsp);
+    rsp->peer = req;
+    req->selected_rsp = rsp;
+    req->error_code = rsp->error_code;
+    req->is_error = rsp->is_error;
+    req->dyn_error_code = rsp->dyn_error_code;
+
+  }
+
+  return rsp;
+}
+
+static rstatus_t msg_each_quorum_rsp_handler(struct context *ctx, struct msg *req,
+    struct msg *rsp) {
+
+  if (all_rspmgrs_done(ctx, req->additional_each_rspmgrs)) {
+    return swallow_extra_rsp(req, rsp);
+  }
+
+  int rspmgr_idx = -1;
+  struct conn *rsp_conn = rsp->owner;
+  if (rsp_conn == NULL) {
+    // TODO: We should remove this case. Test and confirm.
+    rspmgr_idx = 0;
+  } else if (rsp_conn->type == CONN_DNODE_PEER_SERVER) {
+    struct node *peer_instance = (struct node*) rsp_conn->owner;
+    struct string *peer_dc_name = &peer_instance->dc;
+    rspmgr_idx = find_rspmgr_idx(ctx, req->additional_each_rspmgrs, peer_dc_name);
+    if (rspmgr_idx == -1) {
+      log_error("Could not find which DC response was from");
+    }
+  } else if (rsp_conn->type == CONN_SERVER) {
+    // If this is a 'CONN_SERVER' connection, then it is from the same DC.
+    rspmgr_idx = 0;
+  }
+
+  struct response_mgr *rspmgr = req->additional_each_rspmgrs[rspmgr_idx];
+  rspmgr_submit_response(rspmgr, rsp);
+  if (!rspmgr_check_is_done(rspmgr)) return DN_EAGAIN;
+  if (!all_rspmgrs_done(ctx, req->additional_each_rspmgrs)) return DN_EAGAIN;
+
+  rsp = all_rspmgrs_get_response(ctx, req);
   return DN_OK;
 }
 

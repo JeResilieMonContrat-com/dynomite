@@ -129,7 +129,7 @@ static bool memcache_touch(struct msg *r) {
   return false;
 }
 
-void memcache_parse_req(struct msg *r, const struct string *hash_tag) {
+void memcache_parse_req(struct msg *r, struct context *ctx) {
   struct mbuf *b;
   uint8_t *p, *m;
   uint8_t ch;
@@ -159,6 +159,7 @@ void memcache_parse_req(struct msg *r, const struct string *hash_tag) {
     SW_SENTINEL
   } state;
 
+  const struct string* hash_tag = &ctx->pool.hash_tag;
   state = r->state;
   b = STAILQ_LAST(&r->mhdr, mbuf, next);
 
@@ -196,7 +197,7 @@ void memcache_parse_req(struct msg *r, const struct string *hash_tag) {
           m = r->token;
           r->token = NULL;
           r->type = MSG_UNKNOWN;
-          r->narg++;
+          r->ntokens++;
 
           switch (p - m) {
             case 3:
@@ -383,7 +384,7 @@ void memcache_parse_req(struct msg *r, const struct string *hash_tag) {
           kpos->start = r->token;
           kpos->end = p;
 
-          r->narg++;
+          r->ntokens++;
           r->token = NULL;
 
           /* get next state */
@@ -780,7 +781,7 @@ error:
               r->id, r->result, r->type, r->state);
 }
 
-void memcache_parse_rsp(struct msg *r, const struct string *UNUSED) {
+void memcache_parse_rsp(struct msg *r, struct context *ctx) {
   struct mbuf *b;
   uint8_t *p, *m;
   uint8_t ch;
@@ -1325,7 +1326,7 @@ static rstatus_t memcache_fragment_retrieval(struct msg *r,
     }
     r->frag_seq[i] = sub_msg = sub_msgs[idx];
 
-    sub_msg->narg++;
+    sub_msg->ntokens++;
     status = memcache_append_key(sub_msg, kpos->start, kpos->end - kpos->start);
     if (status != DN_OK) {
       dn_free(sub_msgs);
@@ -1614,5 +1615,20 @@ struct msg *memcache_reconcile_responses(struct response_mgr *rspmgr) {
  */
 rstatus_t memcache_rewrite_query(struct msg *orig_msg, struct context *ctx,
                                  bool *did_rewrite, struct msg **new_msg_ptr) {
+  return DN_OK;
+}
+
+rstatus_t memcache_rewrite_query_with_timestamp_md(struct msg *orig_msg,
+    struct context *ctx, bool *did_rewrite, struct msg **new_msg_ptr) {
+  return DN_OK;
+}
+
+rstatus_t memcache_make_repair_query(struct context *ctx, struct response_mgr *rspmgr,
+    struct msg **new_msg_ptr) {
+  return DN_OK;
+}
+
+rstatus_t memcache_clear_repair_md_for_key(struct context *ctx, struct msg *req,
+    struct msg **new_msg_ptr) {
   return DN_OK;
 }
